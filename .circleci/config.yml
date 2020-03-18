@@ -1,0 +1,113 @@
+# PHP CircleCI 2.0 configuration file
+#
+# Check https://circleci.com/docs/2.0/language-php/ for more details
+#
+version: 2
+jobs:
+  build:
+    docker:
+      # Specify the version you desire here
+      - image: php:7.2-fpm
+      - image: circleci/mysql:5.7
+        environment:
+          - MYSQL_ALLOW_EMPTY_PASSWORD: true
+          - MYSQL_DATABASE: twitter-search
+          - MYSQL_USER: root
+          - MYSQL_ROOT_PASSWORD: ''
+
+    working_directory: ~/var/www/html/twitter-search-app
+
+    steps:
+      - checkout
+      - run:
+          name: Install PHP exts
+          command: |
+            apt-get update && apt-get install -y git vim default-mysql-client libfreetype6-dev libjpeg-dev libpng-dev libcurl3-dev zip unzip nodejs npm \
+                  && docker-php-ext-install curl \
+                  && docker-php-ext-install pdo_mysql \
+                  && docker-php-ext-configure gd --with-freetype-dir=/usr/include/ --with-jpeg-dir=/usr/include/ \
+                  && docker-php-ext-install -j$(nproc) gd \
+                  && curl -sS https://getcomposer.org/installer | php \
+                  && mv composer.phar /usr/local/bin/composer \
+                  && npm install n -g \
+                  && n 10.7.0
+          no_output_timeout: 1.5h
+      - run: composer self-update
+
+      # Download and cache dependencies
+      - restore_cache:
+          keys:
+          - v1-dependencies-{{ checksum "composer.json" }}
+          # fallback to using the latest cache if no exact match is found
+          - v1-dependencies-
+
+      - run: composer install -n --prefer-dist
+
+      - save_cache:
+          paths:
+            - ./vendor
+          key: v1-dependencies-{{ checksum "composer.json" }}
+      - run:
+          name: Setup Laravel stuffs
+          command: |
+            echo $ENV | base64 -di > .env
+            php artisan migrate --force
+            php artisan key:generate
+      - run: ./vendor/bin/phpunit
+
+# EC2にSSH接続し、デプロイを実行
+  deploy:
+    machine:
+      image: circleci/classic:edge
+
+    steps:
+      - checkout
+
+      - run:
+          name: "authorize-security-group-ingress"
+          command: |
+            IP=`curl -s ifconfig.me`
+            echo "#!/bin/bash" > ./sg.sh
+            echo "aws configure set region us-east-2" >> ./sg.sh
+            echo "aws ec2 authorize-security-group-ingress --group-id sg-039f06343789fc811 --protocol tcp --port 22 --cidr ${IP}/32" >> ./sg.sh
+            bash ./sg.sh
+
+      # CircleCIに登録した秘密鍵を呼び出す。
+      - add_ssh_keys:
+          fingerprints:
+            - "sshkey"
+
+      - run:
+          name: "start keyscan"
+          command: |
+            ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - run:
+          name: "ssh to aws"
+          command: |
+            ssh ${USER_NAME}@${HOST_NAME} 'cd /home/ec2-user/www/html/twitter-search-app && eval `ssh-agent -s` && ssh-add /home/ec2-user/.ssh/github && git pull origin master && eval `ssh-agent -k`'
+
+      - run:
+          name: "Build App"
+          command: |
+            ssh ${USER_NAME}@${HOST_NAME} 'docker exec -i -d mydocker_php-fpm_1 /bin/bash -c "cd /var/www/html/twitter-search-app && node_modules/webpack/bin/webpack.js --no-progress --hide-modules --config=node_modules/laravel-mix/setup/webpack.config.js"'
+
+      - run:
+          name: "revoke-security-group-ingress"
+          command: |
+            IP=`curl -s ifconfig.me`
+            echo "#!/bin/bash" > ./sg.sh
+            echo "aws configure set region us-east-2" >> ./sg.sh
+            echo "aws ec2 revoke-security-group-ingress --group-id sg-idpid --protocol tcp --port 22 --cidr ${IP}/32" >> ./sg.sh
+            bash ./sg.sh
+
+
+
+workflows:
+  version: 2
+  build_and_deploy:
+    jobs:
+      - build
+      - deploy:
+          requires:
+            - build
